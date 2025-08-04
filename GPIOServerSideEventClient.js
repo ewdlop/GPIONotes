@@ -1,22 +1,20 @@
 #!/usr/bin/env node
 
 /**
- * Node.js Server-Sent Events (SSE) Client for GPIO Control
- * Connects to Raspberry Pi GPIO SSE server and provides command interface
+ * Raspberry Pi GPIO SSE Client with Direct GPIO Control
+ * Listens for commands from SSE server and executes them directly on GPIO pins
  */
 
 const EventSource = require('eventsource');
-const axios = require('axios');
+const gpio = require('rpi-gpio');
 const readline = require('readline');
 const chalk = require('chalk');
 const { performance } = require('perf_hooks');
 
-class GPIOSSEClient {
+class RPiGPIOSSEClient {
     constructor(serverUrl = 'http://localhost:8000') {
         this.serverUrl = serverUrl;
         this.sseUrl = `${serverUrl}/events`;
-        this.apiUrl = `${serverUrl}/api/command`;
-        this.statusUrl = `${serverUrl}/api/status`;
         
         this.eventSource = null;
         this.connected = false;
@@ -24,31 +22,74 @@ class GPIOSSEClient {
         this.maxReconnectAttempts = 10;
         this.reconnectDelay = 5000;
         this.startTime = performance.now();
-        this.commandQueue = [];
-        this.pendingCommands = new Map();
+        
+        // GPIO state tracking
+        this.setupPins = new Map(); // Track configured pins and their directions
+        this.pinStates = new Map(); // Track current pin states
+        this.watchedPins = new Map(); // Track pins being watched for interrupts
         
         // Statistics
         this.stats = {
             messagesReceived: 0,
-            commandsSent: 0,
+            commandsExecuted: 0,
+            gpioOperations: 0,
             interrupts: 0,
             reconnections: 0,
             errors: 0
         };
         
-        // Setup axios defaults
-        axios.defaults.timeout = 10000;
-        axios.defaults.headers.post['Content-Type'] = 'application/json';
-        
-        // Setup readline interface for interactive commands
+        // Setup readline interface for local commands
         this.rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout,
-            prompt: chalk.cyan('gpio> ')
+            prompt: chalk.cyan('rpi-gpio> ')
         });
         
         this.setupEventHandlers();
-        this.setupCommands();
+        this.setupLocalCommands();
+        this.initializeGPIO();
+    }
+    
+    async initializeGPIO() {
+        try {
+            // Set GPIO numbering mode to BCM
+            gpio.setMode(gpio.MODE_BCM);
+            this.log('success', '🔧 GPIO initialized in BCM mode');
+            
+            // Setup common pins with default configurations
+            await this.setupCommonPins();
+            
+        } catch (error) {
+            this.log('error', `GPIO initialization failed: ${error.message}`);
+            this.stats.errors++;
+        }
+    }
+    
+    async setupCommonPins() {
+        // Common pin configurations for typical IoT devices
+        const commonPins = [
+            { pin: 18, direction: 'out', description: 'LED' },
+            { pin: 23, direction: 'out', description: 'Relay' },
+            { pin: 24, direction: 'out', description: 'Buzzer' },
+            { pin: 25, direction: 'in', description: 'Button', pullResistor: 'pullup' },
+            { pin: 7, direction: 'in', description: 'PIR Sensor' },
+            { pin: 8, direction: 'in', description: 'Door Sensor' },
+            { pin: 12, direction: 'in', description: 'Motion Sensor' }
+        ];
+        
+        for (const config of commonPins) {
+            try {
+                await this.setupPin(config.pin, config.direction, config.pullResistor);
+                this.log('info', `📌 Pin ${config.pin} configured as ${config.direction} (${config.description})`);
+                
+                // Watch input pins for changes
+                if (config.direction === 'in') {
+                    await this.watchPin(config.pin, config.description);
+                }
+            } catch (error) {
+                this.log('warn', `Failed to setup pin ${config.pin}: ${error.message}`);
+            }
+        }
     }
     
     setupEventHandlers() {
@@ -62,7 +103,7 @@ class GPIOSSEClient {
         
         // Setup readline handlers
         this.rl.on('line', (input) => {
-            this.handleCommand(input.trim());
+            this.handleLocalCommand(input.trim());
             this.rl.prompt();
         });
         
@@ -71,27 +112,23 @@ class GPIOSSEClient {
         });
     }
     
-    setupCommands() {
-        this.commands = {
+    setupLocalCommands() {
+        this.localCommands = {
             help: () => this.showHelp(),
             connect: () => this.connect(),
             disconnect: () => this.disconnect(),
-            status: () => this.getServerStatus(),
+            status: () => this.showStatus(),
             stats: () => this.showStats(),
             clear: () => console.clear(),
             
-            // GPIO commands
+            // Direct GPIO commands (bypass server)
             on: (pin) => this.setOutput(parseInt(pin), true),
             off: (pin) => this.setOutput(parseInt(pin), false),
             toggle: (pin) => this.toggleOutput(parseInt(pin)),
-            read: (pin) => this.getInput(parseInt(pin)),
-            gpio: () => this.getGPIOStatus(),
-            ping: () => this.ping(),
-            
-            // Bulk operations
-            bulk: () => this.sendBulkCommands(),
-            test: () => this.runTests(),
-            monitor: (duration) => this.startMonitoring(parseInt(duration) || 30),
+            read: (pin) => this.readInput(parseInt(pin)),
+            setup: (pin, direction) => this.setupPin(parseInt(pin), direction),
+            watch: (pin) => this.watchPin(parseInt(pin)),
+            unwatch: (pin) => this.unwatchPin(parseInt(pin)),
             
             // Quick presets
             led: {
@@ -104,9 +141,18 @@ class GPIOSSEClient {
                 off: () => this.setOutput(23, false),
                 toggle: () => this.toggleOutput(23)
             },
-            button: () => this.getInput(25),
-            pir: () => this.getInput(7),
-            door: () => this.getInput(8)
+            buzzer: {
+                on: () => this.setOutput(24, true),
+                off: () => this.setOutput(24, false),
+                beep: (times) => this.beepBuzzer(parseInt(times) || 3)
+            },
+            button: () => this.readInput(25),
+            pir: () => this.readInput(7),
+            door: () => this.readInput(8),
+            
+            // Test commands
+            test: () => this.runTests(),
+            monitor: (duration) => this.startMonitoring(parseInt(duration) || 30)
         };
     }
     
@@ -156,7 +202,7 @@ class GPIOSSEClient {
         this.log('info', '🔴 Disconnected from SSE server');
     }
     
-    handleSSEMessage(event) {
+    async handleSSEMessage(event) {
         try {
             const data = JSON.parse(event.data);
             this.stats.messagesReceived++;
@@ -170,23 +216,80 @@ class GPIOSSEClient {
                     // Silent heartbeat
                     break;
                     
-                case 'interrupt':
-                    this.stats.interrupts++;
-                    this.log('interrupt', `🔔 GPIO ${data.pin} (${data.description}): ${data.state ? 'HIGH' : 'LOW'}`);
+                case 'gpio_command':
+                    await this.executeGPIOCommand(data);
                     break;
                     
-                case 'command_response':
-                    this.handleCommandResponse(data);
+                case 'setup_pin':
+                    await this.setupPin(data.pin, data.direction, data.pullResistor);
+                    break;
+                    
+                case 'watch_pin':
+                    await this.watchPin(data.pin, data.description);
+                    break;
+                    
+                case 'bulk_commands':
+                    await this.executeBulkCommands(data.commands);
                     break;
                     
                 default:
-                    this.log('info', `📨 ${JSON.stringify(data)}`);
+                    this.log('info', `📨 Unknown message type: ${data.type}`);
             }
             
         } catch (error) {
             this.log('error', `Failed to parse SSE message: ${error.message}`);
             this.stats.errors++;
         }
+    }
+    
+    async executeGPIOCommand(data) {
+        try {
+            const { command, pin, state, value } = data;
+            this.stats.commandsExecuted++;
+            
+            switch (command) {
+                case 'set_output':
+                    await this.setOutput(pin, state);
+                    this.log('success', `🔧 Set pin ${pin} to ${state ? 'HIGH' : 'LOW'}`);
+                    break;
+                    
+                case 'get_input':
+                    const inputState = await this.readInput(pin);
+                    this.log('info', `📖 Pin ${pin} state: ${inputState ? 'HIGH' : 'LOW'}`);
+                    break;
+                    
+                case 'toggle_output':
+                    await this.toggleOutput(pin);
+                    break;
+                    
+                case 'pwm':
+                    // Note: Basic GPIO doesn't support PWM, would need pigpio for hardware PWM
+                    this.log('warn', `PWM not supported with rpi-gpio. Pin ${pin} ignored.`);
+                    break;
+                    
+                default:
+                    this.log('error', `Unknown GPIO command: ${command}`);
+            }
+            
+        } catch (error) {
+            this.log('error', `GPIO command failed: ${error.message}`);
+            this.stats.errors++;
+        }
+    }
+    
+    async executeBulkCommands(commands) {
+        this.log('info', `📦 Executing ${commands.length} bulk commands...`);
+        
+        for (const cmd of commands) {
+            try {
+                await this.executeGPIOCommand(cmd);
+                await this.sleep(50); // Small delay between commands
+            } catch (error) {
+                this.log('error', `Bulk command failed: ${error.message}`);
+            }
+        }
+        
+        this.log('success', `📦 Bulk commands completed`);
     }
     
     handleSSEError(error) {
@@ -210,129 +313,121 @@ class GPIOSSEClient {
         }
     }
     
-    handleCommandResponse(data) {
-        const { command_id, success, message } = data;
-        
-        if (this.pendingCommands.has(command_id)) {
-            const { resolve, reject, startTime } = this.pendingCommands.get(command_id);
-            const duration = performance.now() - startTime;
-            
-            this.pendingCommands.delete(command_id);
-            
-            if (success) {
-                this.log('success', `✅ ${message} (${duration.toFixed(1)}ms)`);
-                resolve(data);
-            } else {
-                this.log('error', `❌ ${message}`);
-                reject(new Error(message));
-            }
-        }
-    }
-    
-    async sendCommand(type, pin = null, state = null) {
-        const command = {
-            type,
-            ...(pin !== null && { pin }),
-            ...(state !== null && { state })
-        };
-        
-        try {
-            const startTime = performance.now();
-            const response = await axios.post(this.apiUrl, command);
-            const duration = performance.now() - startTime;
-            
-            this.stats.commandsSent++;
-            
-            if (response.data.success) {
-                this.log('success', `✅ Command sent: ${type} ${pin ? `pin ${pin}` : ''} ${state !== null ? (state ? 'HIGH' : 'LOW') : ''} (${duration.toFixed(1)}ms)`);
-                return response.data;
-            } else {
-                throw new Error(response.data.message || 'Unknown error');
+    async setupPin(pin, direction, pullResistor = null) {
+        return new Promise((resolve, reject) => {
+            const options = {};
+            if (pullResistor) {
+                options.pullResistor = pullResistor === 'pullup' ? gpio.PULL_UP : gpio.PULL_DOWN;
             }
             
-        } catch (error) {
-            this.stats.errors++;
-            const errorMsg = error.response?.data?.detail || error.message;
-            this.log('error', `❌ Command failed: ${errorMsg}`);
-            throw error;
-        }
+            gpio.setup(pin, direction === 'out' ? gpio.DIR_OUT : gpio.DIR_IN, options, (err) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    this.setupPins.set(pin, { direction, pullResistor });
+                    this.stats.gpioOperations++;
+                    resolve();
+                }
+            });
+        });
     }
     
     async setOutput(pin, state) {
-        if (isNaN(pin) || pin < 1 || pin > 40) {
-            this.log('error', 'Invalid pin number (1-40)');
-            return;
+        if (!this.setupPins.has(pin) || this.setupPins.get(pin).direction !== 'out') {
+            await this.setupPin(pin, 'out');
         }
-        return await this.sendCommand('set_output', pin, state);
+        
+        return new Promise((resolve, reject) => {
+            gpio.write(pin, state, (err) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    this.pinStates.set(pin, state);
+                    this.stats.gpioOperations++;
+                    resolve();
+                }
+            });
+        });
     }
     
-    async getInput(pin) {
-        if (isNaN(pin) || pin < 1 || pin > 40) {
-            this.log('error', 'Invalid pin number (1-40)');
-            return;
+    async readInput(pin) {
+        if (!this.setupPins.has(pin)) {
+            await this.setupPin(pin, 'in');
         }
-        return await this.sendCommand('get_input', pin);
+        
+        return new Promise((resolve, reject) => {
+            gpio.read(pin, (err, value) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    this.pinStates.set(pin, value);
+                    this.stats.gpioOperations++;
+                    resolve(value);
+                }
+            });
+        });
     }
     
     async toggleOutput(pin) {
-        if (isNaN(pin) || pin < 1 || pin > 40) {
-            this.log('error', 'Invalid pin number (1-40)');
+        const currentState = this.pinStates.get(pin) || false;
+        await this.setOutput(pin, !currentState);
+        this.log('success', `🔄 Toggled pin ${pin} to ${!currentState ? 'HIGH' : 'LOW'}`);
+    }
+    
+    async watchPin(pin, description = '') {
+        if (this.watchedPins.has(pin)) {
+            this.log('warn', `Pin ${pin} is already being watched`);
             return;
         }
-        return await this.sendCommand('toggle_output', pin);
-    }
-    
-    async getGPIOStatus() {
-        return await this.sendCommand('get_status');
-    }
-    
-    async ping() {
-        const startTime = performance.now();
-        try {
-            await this.sendCommand('ping');
-            const duration = performance.now() - startTime;
-            this.log('success', `🏓 Pong received (${duration.toFixed(1)}ms)`);
-        } catch (error) {
-            this.log('error', `Ping failed: ${error.message}`);
-        }
-    }
-    
-    async getServerStatus() {
-        try {
-            const response = await axios.get(this.statusUrl);
-            const status = response.data;
-            
-            this.log('info', `📊 Server Status:`);
-            console.log(chalk.cyan(`  Connected Clients: ${status.connected_clients}`));
-            console.log(chalk.cyan(`  Commands Sent: ${status.commands_sent}`));
-            console.log(chalk.cyan(`  Server Time: ${status.server_time}`));
-            console.log(chalk.cyan(`  Status: ${status.status}`));
-            
-        } catch (error) {
-            this.log('error', `Failed to get server status: ${error.message}`);
-        }
-    }
-    
-    async sendBulkCommands() {
-        const commands = [
-            { type: 'ping' },
-            { type: 'get_status' },
-            { type: 'get_input', pin: 25 },
-            { type: 'set_output', pin: 18, state: true },
-            { type: 'set_output', pin: 18, state: false }
-        ];
         
-        try {
-            const response = await axios.post(`${this.serverUrl}/api/commands/bulk`, commands);
-            this.log('success', `📦 Bulk commands sent: ${response.data.total_commands} commands`);
-            
-            response.data.results.forEach((result, index) => {
-                const status = result.success ? '✅' : '❌';
-                this.log('info', `  ${status} Command ${index + 1}: ${JSON.stringify(result.command)}`);
-            });
-            
-        } catch (error) {
-            this.log('error', `Bulk command failed: ${error.message}`);
+        if (!this.setupPins.has(pin)) {
+            await this.setupPin(pin, 'in');
+        }
+        
+        // Poll the pin for changes (rpi-gpio doesn't support interrupts directly)
+        const watchInterval = setInterval(async () => {
+            try {
+                const currentState = await this.readInput(pin);
+                const lastState = this.watchedPins.get(pin)?.lastState;
+                
+                if (lastState !== undefined && currentState !== lastState) {
+                    this.stats.interrupts++;
+                    this.log('interrupt', `🔔 Pin ${pin} ${description ? '(' + description + ')' : ''}: ${lastState ? 'HIGH' : 'LOW'} → ${currentState ? 'HIGH' : 'LOW'}`);
+                    
+                    // Send interrupt notification back to server if connected
+                    if (this.connected) {
+                        // Could send interrupt data back to server here if needed
+                    }
+                }
+                
+                this.watchedPins.set(pin, { 
+                    interval: watchInterval, 
+                    lastState: currentState,
+                    description: description || `Pin ${pin}`
+                });
+                
+            } catch (error) {
+                this.log('error', `Error watching pin ${pin}: ${error.message}`);
+            }
+        }, 100); // Check every 100ms
+        
+        this.watchedPins.set(pin, { 
+            interval: watchInterval, 
+            lastState: undefined,
+            description: description || `Pin ${pin}`
+        });
+        
+        this.log('success', `👁️ Watching pin ${pin} ${description ? '(' + description + ')' : ''} for changes`);
+    }
+    
+    unwatchPin(pin) {
+        if (this.watchedPins.has(pin)) {
+            const watchData = this.watchedPins.get(pin);
+            clearInterval(watchData.interval);
+            this.watchedPins.delete(pin);
+            this.log('success', `👁️ Stopped watching pin ${pin}`);
+        } else {
+            this.log('warn', `Pin ${pin} is not being watched`);
         }
     }
     
@@ -349,43 +444,63 @@ class GPIOSSEClient {
         this.log('success', '💡 LED blink sequence completed');
     }
     
+    async beepBuzzer(times = 3) {
+        this.log('info', `🔊 Beeping buzzer ${times} times...`);
+        
+        for (let i = 0; i < times; i++) {
+            await this.setOutput(24, true);
+            await this.sleep(200);
+            await this.setOutput(24, false);
+            await this.sleep(300);
+        }
+        
+        this.log('success', '🔊 Buzzer beep sequence completed');
+    }
+    
     async runTests() {
         this.log('info', '🧪 Running GPIO tests...');
         
         const tests = [
-            () => this.ping(),
-            () => this.getGPIOStatus(),
-            () => this.getInput(25),
-            () => this.setOutput(18, true),
-            () => this.sleep(1000),
-            () => this.setOutput(18, false),
-            () => this.toggleOutput(23),
-            () => this.sleep(1000),
-            () => this.toggleOutput(23)
+            { name: 'LED On', action: () => this.setOutput(18, true) },
+            { name: 'Wait 1s', action: () => this.sleep(1000) },
+            { name: 'LED Off', action: () => this.setOutput(18, false) },
+            { name: 'Relay Toggle', action: () => this.toggleOutput(23) },
+            { name: 'Wait 1s', action: () => this.sleep(1000) },
+            { name: 'Relay Toggle', action: () => this.toggleOutput(23) },
+            { name: 'Read Button', action: () => this.readInput(25) },
+            { name: 'Read PIR', action: () => this.readInput(7) },
+            { name: 'Buzzer Beep', action: () => this.beepBuzzer(2) }
         ];
         
         for (const test of tests) {
             try {
-                await test();
-                await this.sleep(200); // Small delay between tests
+                this.log('info', `🧪 ${test.name}...`);
+                await test.action();
+                await this.sleep(200);
             } catch (error) {
-                this.log('error', `Test failed: ${error.message}`);
+                this.log('error', `❌ ${test.name} failed: ${error.message}`);
             }
         }
         
-        this.log('success', '🧪 Tests completed');
+        this.log('success', '🧪 All tests completed');
     }
     
     startMonitoring(duration = 30) {
-        this.log('info', `📊 Starting monitoring for ${duration} seconds...`);
+        this.log('info', `📊 Starting GPIO monitoring for ${duration} seconds...`);
         
+        const monitorPins = [25, 7, 8]; // Button, PIR, Door
         const interval = setInterval(async () => {
-            try {
-                await this.getGPIOStatus();
-            } catch (error) {
-                this.log('error', `Monitoring error: ${error.message}`);
+            for (const pin of monitorPins) {
+                try {
+                    const state = await this.readInput(pin);
+                    const pinInfo = this.setupPins.get(pin);
+                    console.log(`Pin ${pin}: ${state ? 'HIGH' : 'LOW'}`);
+                } catch (error) {
+                    this.log('error', `Monitoring error pin ${pin}: ${error.message}`);
+                }
             }
-        }, 5000);
+            console.log('---');
+        }, 2000);
         
         setTimeout(() => {
             clearInterval(interval);
@@ -394,7 +509,7 @@ class GPIOSSEClient {
         }, duration * 1000);
     }
     
-    handleCommand(input) {
+    handleLocalCommand(input) {
         if (!input) return;
         
         const parts = input.split(' ');
@@ -402,8 +517,8 @@ class GPIOSSEClient {
         const args = parts.slice(1);
         
         try {
-            if (command in this.commands) {
-                const cmd = this.commands[command];
+            if (command in this.localCommands) {
+                const cmd = this.localCommands[command];
                 if (typeof cmd === 'function') {
                     cmd(...args);
                 } else if (typeof cmd === 'object' && args[0] in cmd) {
@@ -411,8 +526,9 @@ class GPIOSSEClient {
                 } else {
                     this.log('error', `Unknown subcommand: ${args[0]}`);
                 }
+            } else if (command === 'exit' || command === 'quit') {
+                this.shutdown();
             } else {
-                // Try to parse as direct GPIO command
                 this.parseDirectCommand(input);
             }
         } catch (error) {
@@ -421,15 +537,16 @@ class GPIOSSEClient {
     }
     
     parseDirectCommand(input) {
-        // Handle direct GPIO commands like "pin 18 on", "read 25", etc.
         const patterns = [
             { regex: /^pin\s+(\d+)\s+(on|high)$/i, action: (pin) => this.setOutput(parseInt(pin), true) },
             { regex: /^pin\s+(\d+)\s+(off|low)$/i, action: (pin) => this.setOutput(parseInt(pin), false) },
             { regex: /^pin\s+(\d+)\s+toggle$/i, action: (pin) => this.toggleOutput(parseInt(pin)) },
-            { regex: /^read\s+(\d+)$/i, action: (pin) => this.getInput(parseInt(pin)) },
+            { regex: /^read\s+(\d+)$/i, action: (pin) => this.readInput(parseInt(pin)) },
             { regex: /^(\d+)\s+(on|high)$/i, action: (pin) => this.setOutput(parseInt(pin), true) },
             { regex: /^(\d+)\s+(off|low)$/i, action: (pin) => this.setOutput(parseInt(pin), false) },
-            { regex: /^(\d+)\s+toggle$/i, action: (pin) => this.toggleOutput(parseInt(pin)) }
+            { regex: /^(\d+)\s+toggle$/i, action: (pin) => this.toggleOutput(parseInt(pin)) },
+            { regex: /^watch\s+(\d+)$/i, action: (pin) => this.watchPin(parseInt(pin)) },
+            { regex: /^unwatch\s+(\d+)$/i, action: (pin) => this.unwatchPin(parseInt(pin)) }
         ];
         
         for (const pattern of patterns) {
@@ -444,56 +561,77 @@ class GPIOSSEClient {
     }
     
     showHelp() {
-        console.log(chalk.yellow('\n📋 Available Commands:\n'));
+        console.log(chalk.yellow('\n📋 RPi GPIO SSE Client Commands:\n'));
         
         console.log(chalk.cyan('Connection:'));
-        console.log('  connect          - Connect to SSE server');
+        console.log('  connect          - Connect to SSE server for remote commands');
         console.log('  disconnect       - Disconnect from SSE server');
-        console.log('  status           - Get server status');
+        console.log('  status           - Show GPIO and connection status');
         console.log('  stats            - Show client statistics');
         
-        console.log(chalk.cyan('\nGPIO Control:'));
+        console.log(chalk.cyan('\nDirect GPIO Control:'));
         console.log('  on <pin>         - Turn pin ON (set HIGH)');
         console.log('  off <pin>        - Turn pin OFF (set LOW)');
         console.log('  toggle <pin>     - Toggle pin state');
         console.log('  read <pin>       - Read pin state');
-        console.log('  gpio             - Get all GPIO status');
-        console.log('  ping             - Ping the device');
+        console.log('  setup <pin> <in|out> - Setup pin direction');
+        console.log('  watch <pin>      - Watch pin for changes');
+        console.log('  unwatch <pin>    - Stop watching pin');
         
         console.log(chalk.cyan('\nQuick Controls:'));
-        console.log('  led on/off       - Control LED (pin 18)');
-        console.log('  led blink [n]    - Blink LED n times');
-        console.log('  relay on/off     - Control relay (pin 23)');
+        console.log('  led on/off/blink - Control LED (pin 18)');
+        console.log('  relay on/off/toggle - Control relay (pin 23)');
+        console.log('  buzzer on/off/beep - Control buzzer (pin 24)');
         console.log('  button           - Read button (pin 25)');
         console.log('  pir              - Read PIR sensor (pin 7)');
         console.log('  door             - Read door sensor (pin 8)');
         
-        console.log(chalk.cyan('\nBatch Operations:'));
-        console.log('  bulk             - Send bulk test commands');
+        console.log(chalk.cyan('\nUtility:'));
         console.log('  test             - Run GPIO test sequence');
         console.log('  monitor [sec]    - Monitor GPIO for n seconds');
-        
-        console.log(chalk.cyan('\nDirect GPIO Syntax:'));
-        console.log('  pin 18 on        - Turn pin 18 on');
-        console.log('  18 off           - Turn pin 18 off');
-        console.log('  read 25          - Read pin 25');
-        console.log('  23 toggle        - Toggle pin 23');
-        
-        console.log(chalk.cyan('\nUtility:'));
-        console.log('  help             - Show this help');
         console.log('  clear            - Clear screen');
+        console.log('  help             - Show this help');
         console.log('  exit/quit        - Exit application\n');
+        
+        console.log(chalk.yellow('Note: This client executes GPIO commands locally while listening for remote commands via SSE.\n'));
+    }
+    
+    showStatus() {
+        console.log(chalk.yellow('\n📊 System Status:\n'));
+        console.log(chalk.cyan(`  SSE Connected: ${this.connected ? 'Yes' : 'No'}`));
+        console.log(chalk.cyan(`  GPIO Mode: BCM`));
+        console.log(chalk.cyan(`  Setup Pins: ${this.setupPins.size}`));
+        console.log(chalk.cyan(`  Watched Pins: ${this.watchedPins.size}`));
+        
+        if (this.setupPins.size > 0) {
+            console.log(chalk.cyan('\n  Configured Pins:'));
+            this.setupPins.forEach((config, pin) => {
+                const state = this.pinStates.get(pin);
+                const stateStr = state !== undefined ? (state ? 'HIGH' : 'LOW') : 'Unknown';
+                console.log(chalk.cyan(`    Pin ${pin}: ${config.direction.toUpperCase()} - ${stateStr}`));
+            });
+        }
+        
+        if (this.watchedPins.size > 0) {
+            console.log(chalk.cyan('\n  Watched Pins:'));
+            this.watchedPins.forEach((config, pin) => {
+                console.log(chalk.cyan(`    Pin ${pin}: ${config.description}`));
+            });
+        }
+        
+        console.log();
     }
     
     showStats() {
         const uptime = (performance.now() - this.startTime) / 1000;
         
         console.log(chalk.yellow('\n📊 Client Statistics:\n'));
-        console.log(chalk.cyan(`  Connected: ${this.connected ? 'Yes' : 'No'}`));
         console.log(chalk.cyan(`  Uptime: ${uptime.toFixed(1)}s`));
+        console.log(chalk.cyan(`  SSE Connected: ${this.connected ? 'Yes' : 'No'}`));
         console.log(chalk.cyan(`  Messages Received: ${this.stats.messagesReceived}`));
-        console.log(chalk.cyan(`  Commands Sent: ${this.stats.commandsSent}`));
-        console.log(chalk.cyan(`  Interrupts: ${this.stats.interrupts}`));
+        console.log(chalk.cyan(`  Commands Executed: ${this.stats.commandsExecuted}`));
+        console.log(chalk.cyan(`  GPIO Operations: ${this.stats.gpioOperations}`));
+        console.log(chalk.cyan(`  Interrupts Detected: ${this.stats.interrupts}`));
         console.log(chalk.cyan(`  Reconnections: ${this.stats.reconnections}`));
         console.log(chalk.cyan(`  Errors: ${this.stats.errors}`));
         console.log(chalk.cyan(`  Server URL: ${this.serverUrl}\n`));
@@ -518,26 +656,41 @@ class GPIOSSEClient {
     }
     
     async shutdown() {
-        this.log('info', '🛑 Shutting down GPIO SSE Client...');
+        this.log('info', '🛑 Shutting down RPi GPIO SSE Client...');
         
+        // Stop watching pins
+        for (const pin of this.watchedPins.keys()) {
+            this.unwatchPin(pin);
+        }
+        
+        // Cleanup GPIO
+        try {
+            gpio.destroy(() => {
+                this.log('info', '🔧 GPIO cleaned up');
+            });
+        } catch (error) {
+            this.log('error', `GPIO cleanup error: ${error.message}`);
+        }
+        
+        // Disconnect from server
         this.disconnect();
         this.rl.close();
         
-        // Wait a bit for cleanup
         await this.sleep(1000);
-        
         this.log('info', '👋 Goodbye!');
         process.exit(0);
     }
     
     start() {
-        console.log(chalk.yellow('🍓 GPIO SSE Client for Raspberry Pi\n'));
+        console.log(chalk.yellow('🍓 Raspberry Pi GPIO SSE Client\n'));
+        console.log(chalk.cyan('This client listens for SSE commands and controls GPIO directly.\n'));
+        
         this.showHelp();
         
-        // Auto-connect
+        // Auto-connect to SSE server
         this.connect();
         
-        // Start interactive prompt
+        // Start interactive prompt for local commands
         this.rl.prompt();
         
         return this;
@@ -579,7 +732,7 @@ function parseArgs() {
 
 function showCLIHelp() {
     console.log(`
-Usage: node gpio-sse-client.js [options]
+Usage: node rpi-gpio-sse-client.js [options]
 
 Options:
   -s, --server <url>    SSE server URL (default: http://localhost:8000)
@@ -588,15 +741,21 @@ Options:
   -h, --help            Show this help
 
 Examples:
-  node gpio-sse-client.js
-  node gpio-sse-client.js --server http://192.168.1.100:8000
-  node gpio-sse-client.js --no-connect --verbose
+  node rpi-gpio-sse-client.js
+  node rpi-gpio-sse-client.js --server http://192.168.1.100:8000
+  node rpi-gpio-sse-client.js --no-connect
+
+This client runs on the Raspberry Pi and:
+- Listens for GPIO commands from an SSE server
+- Executes commands directly on GPIO pins using rpi-gpio
+- Provides local interactive GPIO control
+- Monitors pins for changes and reports interrupts
 `);
 }
 
 // Check dependencies
 function checkDependencies() {
-    const required = ['eventsource', 'axios', 'chalk'];
+    const required = ['eventsource', 'rpi-gpio', 'chalk'];
     const missing = [];
     
     for (const dep of required) {
@@ -619,13 +778,13 @@ if (require.main === module) {
     checkDependencies();
     
     const options = parseArgs();
-    const client = new GPIOSSEClient(options.server);
+    const client = new RPiGPIOSSEClient(options.server);
     
     if (!options.autoConnect) {
-        client.log('info', 'Auto-connect disabled. Use "connect" command to connect.');
+        client.log('info', 'Auto-connect disabled. Use "connect" command to connect to SSE server.');
     }
     
     client.start();
 }
 
-module.exports = GPIOSSEClient;
+module.exports = RPiGPIOSSEClient;
